@@ -1,0 +1,38 @@
+# generated using pymatgen
+data_Li2PNO2
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   4.68560000
+_cell_length_b   5.27753040
+_cell_length_c   5.27753040
+_cell_angle_alpha   118.45994557
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   90.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   Li2PNO2
+_chemical_formula_sum   'Li4 P2 N2 O4'
+_cell_volume   114.73341277
+_cell_formula_units_Z   2
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Li  Li0  1  0.50047774  0.30025387  0.94717899  1.0
+  Li  Li0  1  0.00047774  0.69974613  0.05282101  1.0
+  Li  Li0  1  0.50047774  0.94717899  0.30025387  1.0
+  Li  Li0  1  0.00047774  0.05282101  0.69974613  1.0
+  N  N2  1  0.35528411  0.38470071  0.38470071  1.0
+  N  N2  1  0.85528411  0.61529929  0.61529929  1.0
+  O  O3  1  0.92238587  0.33807153  0.06223223  1.0
+  O  O3  1  0.42238587  0.66192847  0.93776777  1.0
+  O  O3  1  0.92238587  0.06223223  0.33807153  1.0
+  O  O3  1  0.42238587  0.93776777  0.66192847  1.0
+  P  P1  1  0.01144128  0.32813588  0.32813588  1.0
+  P  P1  1  0.51144128  0.67186412  0.67186412  1.0

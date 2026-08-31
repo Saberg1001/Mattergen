@@ -158,6 +158,8 @@ mattergen/evaluation/utils/structure_matcher.py
 mattergen/evaluation/utils/symmetry_analysis.py
 mattergen/evaluation/utils/utils.py
 mattergen/evaluation/utils/vasprunlike.py
+mattergen/sampling_conf/csp.yaml
+mattergen/sampling_conf/default.yaml
 mattergen/scripts/__init__.py
 mattergen/scripts/csv_to_dataset.py
 mattergen/scripts/evaluate.py
@@ -165,6 +167,7 @@ mattergen/scripts/finetune.py
 mattergen/scripts/generate.py
 mattergen/scripts/run.py
 mattergen/tests/__init__.py
+mattergen/tests/test_correction_schemes.py
 mattergen/tests/test_diffusion_instantiation.py
 mattergen/tests/test_generator.py
 mattergen/tests/test_mattergen_denoiser.py

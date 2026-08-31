@@ -19,7 +19,8 @@ import math
 import random
 import sys
 import time
-from dataclasses import asdict, dataclass
+import warnings
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Collection, Iterable, Mapping, Sequence
 
@@ -102,6 +103,7 @@ class CandidateResult:
     parent_id: str
     source_file: str
     status: str
+    attempt: int = 0
     message: str = ""
     reference_formula: str = ""
     source_formula: str = ""
@@ -130,9 +132,31 @@ class CandidateResult:
     ordered_formula: str = ""
     ranker: str = "none"
     relaxed: bool = False
+    converged: bool | None = None
+    relaxation_steps: int | None = None
+    relaxation_seconds: float | None = None
     total_energy_ev: float | None = None
     energy_per_atom_ev: float | None = None
     output_file: str = ""
+
+
+@dataclass
+class AnomalyResult:
+    parent_id: str
+    source_file: str
+    stage: str
+    status: str
+    attempt: int = 0
+    resolved: bool = False
+    resolution: str = ""
+    message: str = ""
+    candidate_index: int | None = None
+    num_atoms: int | None = None
+    converged: bool | None = None
+    relaxation_steps: int | None = None
+    relaxation_seconds: float | None = None
+    total_energy_ev: float | None = None
+    energy_per_atom_ev: float | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +166,9 @@ class RankedStructure:
     total_energy_ev: float | None
     energy_per_atom_ev: float | None
     error: str = ""
+    converged: bool | None = None
+    relaxation_steps: int | None = None
+    relaxation_seconds: float | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -161,6 +188,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--report-path", type=Path, default=Path("OBELIX/ordering_report.csv")
     )
     io_group.add_argument(
+        "--anomaly-path",
+        type=Path,
+        default=None,
+        help=(
+            "CSV for processing, ordering, and relaxation anomalies. By default, "
+            "place it next to --report-path with an _anomalies suffix."
+        ),
+    )
+    io_group.add_argument(
         "--composition-csv",
         type=Path,
         default=Path("OBELIX/all.csv"),
@@ -178,6 +214,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Replace colliding output files and the existing report.",
+    )
+    io_group.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep existing reports and skip every material already in the main report.",
+    )
+    io_group.add_argument(
+        "--retry-anomalies",
+        action="store_true",
+        help=(
+            "Reprocess only materials with retryable errors in --anomaly-path. "
+            "A new deterministic random seed is used for each retry attempt."
+        ),
     )
     io_group.add_argument("--progress-every", type=int, default=1)
 
@@ -330,7 +379,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ranker_group.add_argument("--device", type=str, default="cpu")
     ranker_group.add_argument("--fmax", type=float, default=0.08)
-    ranker_group.add_argument("--relax-steps", type=int, default=300)
+    ranker_group.add_argument(
+        "--relax-steps",
+        type=int,
+        default=300,
+        help="Maximum optimization steps per candidate for CHGNet and MatterSim.",
+    )
+    ranker_group.add_argument(
+        "--relax-timeout",
+        type=float,
+        default=600.0,
+        help=(
+            "Maximum MatterSim wall time in seconds per active candidate. "
+            "Zero disables the time limit."
+        ),
+    )
+    ranker_group.add_argument(
+        "--step-progress-every",
+        type=int,
+        default=25,
+        help="Print MatterSim step distributions every N batch optimization steps.",
+    )
     ranker_group.add_argument(
         "--relax-cell", action=argparse.BooleanOptionalAction, default=True
     )
@@ -1458,7 +1527,9 @@ def generate_unique_candidates(
 class Ranker:
     name = "none"
 
-    def rank(self, structures: Sequence[Structure]) -> list[RankedStructure]:
+    def rank(
+        self, structures: Sequence[Structure], label: str = ""
+    ) -> list[RankedStructure]:
         return [
             RankedStructure(
                 structure=structure,
@@ -1489,9 +1560,12 @@ class CHGNetRanker(Ranker):
         self.steps = steps
         self.relax_cell = relax_cell
 
-    def rank(self, structures: Sequence[Structure]) -> list[RankedStructure]:
+    def rank(
+        self, structures: Sequence[Structure], label: str = ""
+    ) -> list[RankedStructure]:
         ranked: list[RankedStructure] = []
         for structure in structures:
+            relaxation_start = time.monotonic()
             try:
                 result = self.optimizer.relax(
                     structure,
@@ -1502,12 +1576,15 @@ class CHGNetRanker(Ranker):
                 )
                 relaxed = result["final_structure"]
                 total_energy = float(result["trajectory"].energies[-1])
+                relaxation_steps = max(0, len(result["trajectory"].energies) - 1)
                 ranked.append(
                     RankedStructure(
                         structure=relaxed,
                         relaxed=True,
                         total_energy_ev=total_energy,
                         energy_per_atom_ev=total_energy / len(relaxed),
+                        relaxation_steps=relaxation_steps,
+                        relaxation_seconds=time.monotonic() - relaxation_start,
                     )
                 )
             except Exception as exc:
@@ -1518,6 +1595,8 @@ class CHGNetRanker(Ranker):
                         total_energy_ev=None,
                         energy_per_atom_ev=None,
                         error=f"{type(exc).__name__}: {exc}",
+                        converged=False,
+                        relaxation_seconds=time.monotonic() - relaxation_start,
                     )
                 )
         return ranked
@@ -1531,6 +1610,9 @@ class MatterSimRanker(Ranker):
         device: str,
         fmax: float,
         relax_cell: bool,
+        steps: int,
+        timeout: float,
+        step_progress_every: int,
         max_natoms_per_batch: int,
         potential_path: Path | None,
     ) -> None:
@@ -1543,24 +1625,151 @@ class MatterSimRanker(Ranker):
             load_path=load_path,
             load_training_state=False,
         )
-        self.relaxer = BatchRelaxer(
+
+        class StepLimitedBatchRelaxer(BatchRelaxer):
+            """Bound MatterSim relaxation and expose per-candidate step counts."""
+
+            def __init__(self, *relaxer_args: Any, **relaxer_kwargs: Any) -> None:
+                super().__init__(*relaxer_args, **relaxer_kwargs)
+                self.max_steps = steps
+                self.max_seconds = timeout
+                self.progress_every = step_progress_every
+                self.expected_count = 0
+                self.batch_steps = 0
+                self.label = ""
+                self.step_counts: dict[int, int] = {}
+                self.start_times: dict[int, float] = {}
+                self.elapsed_seconds: dict[int, float] = {}
+                self.converged_indices: set[int] = set()
+                self.capped_indices: set[int] = set()
+                self.timed_out_indices: set[int] = set()
+
+            def insert(self, atoms: Any) -> None:
+                super().insert(atoms)
+                index = int(atoms.info["structure_index"])
+                self.step_counts.setdefault(index, 0)
+                self.start_times.setdefault(index, time.monotonic())
+
+            def step_batch(self) -> None:
+                active_before = {
+                    int(opt.atoms.info["structure_index"])
+                    for opt in self.optimizer_instances
+                }
+                super().step_batch()
+                self.batch_steps += 1
+                for index in active_before:
+                    self.step_counts[index] += 1
+
+                active_after = {
+                    int(opt.atoms.info["structure_index"])
+                    for opt in self.optimizer_instances
+                }
+                newly_converged = active_before - active_after
+                self.converged_indices.update(newly_converged)
+
+                retained_optimizers = []
+                now = time.monotonic()
+                for index in newly_converged:
+                    self.elapsed_seconds[index] = now - self.start_times[index]
+                for optimizer in self.optimizer_instances:
+                    index = int(optimizer.atoms.info["structure_index"])
+                    timed_out = (
+                        self.max_seconds > 0
+                        and now - self.start_times[index] >= self.max_seconds
+                    )
+                    if timed_out:
+                        self.timed_out_indices.add(index)
+                    if self.step_counts[index] >= self.max_steps or timed_out:
+                        self.capped_indices.add(index)
+                        self.elapsed_seconds[index] = now - self.start_times[index]
+                    else:
+                        retained_optimizers.append(optimizer)
+                self.optimizer_instances = retained_optimizers
+                self.is_active_instance = [True] * len(retained_optimizers)
+                self.finished = not self.optimizer_instances
+
+                if self.batch_steps % self.progress_every == 0:
+                    self.print_step_summary(final=False)
+
+            def print_step_summary(self, final: bool) -> None:
+                values = list(self.step_counts.values())
+                if not values:
+                    return
+                now = time.monotonic()
+                elapsed_values = [
+                    self.elapsed_seconds.get(index, now - self.start_times[index])
+                    for index in self.step_counts
+                ]
+                prefix = "summary" if final else "progress"
+                print(
+                    f"MatterSim steps [{self.label}] {prefix}: "
+                    f"inserted={len(values)}/{self.expected_count} "
+                    f"active={len(self.optimizer_instances)} "
+                    f"converged={len(self.converged_indices)} "
+                    f"capped={len(self.capped_indices)} "
+                    f"timed_out={len(self.timed_out_indices)} "
+                    f"min/median/p90/max={min(values)}/"
+                    f"{np.median(values):.1f}/{np.percentile(values, 90):.1f}/"
+                    f"{max(values)} "
+                    f"seconds[min/median/p90/max]={min(elapsed_values):.1f}/"
+                    f"{np.median(elapsed_values):.1f}/"
+                    f"{np.percentile(elapsed_values, 90):.1f}/"
+                    f"{max(elapsed_values):.1f}",
+                    flush=True,
+                )
+
+            def relax(
+                self, atoms_list: list[Any], label: str = ""
+            ) -> dict[int, list[Any]]:
+                self.optimizer_instances = []
+                self.is_active_instance = []
+                self.finished = False
+                self.expected_count = len(atoms_list)
+                self.batch_steps = 0
+                self.label = label
+                self.step_counts = {}
+                self.start_times = {}
+                self.elapsed_seconds = {}
+                self.converged_indices = set()
+                self.capped_indices = set()
+                self.timed_out_indices = set()
+                trajectories = super().relax(atoms_list)
+                self.print_step_summary(final=True)
+                return trajectories
+
+        self.relaxer = StepLimitedBatchRelaxer(
             potential=potential,
             filter="EXPCELLFILTER" if relax_cell else None,
             fmax=fmax,
             max_natoms_per_batch=max_natoms_per_batch,
         )
 
-    def rank(self, structures: Sequence[Structure]) -> list[RankedStructure]:
+    def rank(
+        self, structures: Sequence[Structure], label: str = ""
+    ) -> list[RankedStructure]:
         from pymatgen.io.ase import AseAtomsAdaptor
 
         atoms = [AseAtomsAdaptor.get_atoms(structure) for structure in structures]
         try:
-            trajectories = self.relaxer.relax(atoms)
+            trajectories = self.relaxer.relax(atoms, label=label)
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             return [
-                RankedStructure(structure, False, None, None, message)
-                for structure in structures
+                RankedStructure(
+                    structure=structure,
+                    relaxed=False,
+                    total_energy_ev=None,
+                    energy_per_atom_ev=None,
+                    error=message,
+                    converged=False,
+                    relaxation_steps=self.relaxer.step_counts.get(index),
+                    relaxation_seconds=(
+                        time.monotonic() - self.relaxer.start_times[index]
+                        if index in self.relaxer.start_times
+                        else None
+                    ),
+                )
+                for index, structure in enumerate(structures)
             ]
 
         ranked: list[RankedStructure] = []
@@ -1569,12 +1778,26 @@ class MatterSimRanker(Ranker):
                 final_atoms = trajectories[index][-1]
                 relaxed = AseAtomsAdaptor.get_structure(final_atoms)
                 total_energy = float(final_atoms.info["total_energy"])
+                converged = index in self.relaxer.converged_indices
+                if index in self.relaxer.timed_out_indices:
+                    error = (
+                        "Did not converge within "
+                        f"{self.relaxer.max_seconds:g} seconds"
+                    )
+                elif index in self.relaxer.capped_indices:
+                    error = f"Did not converge within {self.relaxer.max_steps} steps"
+                else:
+                    error = ""
                 ranked.append(
                     RankedStructure(
                         structure=relaxed,
                         relaxed=True,
                         total_energy_ev=total_energy,
                         energy_per_atom_ev=total_energy / len(relaxed),
+                        error=error,
+                        converged=converged,
+                        relaxation_steps=self.relaxer.step_counts.get(index),
+                        relaxation_seconds=self.relaxer.elapsed_seconds.get(index),
                     )
                 )
             except Exception as exc:
@@ -1585,6 +1808,9 @@ class MatterSimRanker(Ranker):
                         total_energy_ev=None,
                         energy_per_atom_ev=None,
                         error=f"{type(exc).__name__}: {exc}",
+                        converged=False,
+                        relaxation_steps=self.relaxer.step_counts.get(index),
+                        relaxation_seconds=self.relaxer.elapsed_seconds.get(index),
                     )
                 )
         return ranked
@@ -1603,6 +1829,9 @@ def make_ranker(args: argparse.Namespace) -> Ranker:
             device=args.device,
             fmax=args.fmax,
             relax_cell=args.relax_cell,
+            steps=args.relax_steps,
+            timeout=args.relax_timeout,
+            step_progress_every=args.step_progress_every,
             max_natoms_per_batch=args.max_natoms_per_batch,
             potential_path=args.potential_path,
         )
@@ -1616,10 +1845,31 @@ def parse_structure(path: Path) -> Structure:
     return structures[0]
 
 
-def energy_sort_key(item: tuple[int, RankedStructure]) -> tuple[bool, float, int]:
+def energy_sort_key(
+    item: tuple[int, RankedStructure],
+) -> tuple[bool, bool, float, int]:
     index, ranked = item
     energy = ranked.energy_per_atom_ev
-    return energy is None, float("inf") if energy is None else energy, index
+    return (
+        ranked.converged is False,
+        energy is None,
+        float("inf") if energy is None else energy,
+        index,
+    )
+
+
+def relaxation_outcome(ranked: RankedStructure) -> str:
+    if ranked.converged is True:
+        return "converged"
+    if "seconds" in ranked.error:
+        return "timeout"
+    if "steps" in ranked.error:
+        return "step_limit"
+    if ranked.error:
+        return "error"
+    if ranked.converged is False:
+        return "not_converged"
+    return "not_evaluated"
 
 
 def ordered_output_path(output_dir: Path, material_id: str, output_index: int) -> Path:
@@ -1643,8 +1893,10 @@ def process_disordered_structure(
     args: argparse.Namespace,
     ranker: Ranker,
     reference_composition: Composition | None,
-) -> list[CandidateResult]:
+    attempt: int = 0,
+) -> tuple[list[CandidateResult], list[AnomalyResult]]:
     material_id = path.stem
+    anomalies: list[AnomalyResult] = []
     source = parse_structure(path)
     source_formula = source.composition.formula
     reference_formula = (
@@ -1673,6 +1925,7 @@ def process_disordered_structure(
             parent_id=material_id,
             source_file=str(path),
             status="copied_ordered" if args.include_ordered else "skipped_ordered",
+            attempt=attempt,
             message=message,
             reference_formula=reference_formula,
             source_formula=source_formula,
@@ -1689,12 +1942,24 @@ def process_disordered_structure(
         )
         if args.include_ordered:
             output_path = ordered_output_path(args.output_dir, material_id, 0)
-            check_output_collisions([output_path], args.overwrite)
+            check_output_collisions([output_path], args.overwrite or args.resume)
             CifWriter(source).write_file(output_path)
             result.num_atoms = len(source)
             result.ordered_formula = source.composition.formula
             result.output_file = str(output_path)
-        return [result]
+        if message:
+            anomalies.append(
+                AnomalyResult(
+                    parent_id=material_id,
+                    source_file=str(path),
+                    stage="input_validation",
+                    status="reference_mismatch",
+                    attempt=attempt,
+                    message=message,
+                    num_atoms=len(source),
+                )
+            )
+        return [result], anomalies
 
     cleaned, dropped_count, dropped_sum = clean_small_occupancies(
         source,
@@ -1774,14 +2039,75 @@ def process_disordered_structure(
             groups,
             num_candidates=args.num_candidates,
             max_attempts_per_candidate=args.max_attempts_per_candidate,
-            seed=stable_seed(args.seed, material_id),
+            seed=stable_seed(args.seed + attempt * 1_000_003, material_id),
         )
         candidate_method = "random"
     if not candidates:
         raise RuntimeError("No unique ordered candidate was generated")
 
-    ranked_candidates = ranker.rank(candidates)
-    indexed_ranked = sorted(enumerate(ranked_candidates), key=energy_sort_key)
+    ranked_candidates = ranker.rank(candidates, label=material_id)
+    valid_ranked = [
+        item
+        for item in enumerate(ranked_candidates)
+        if item[1].converged is not False
+        and item[1].energy_per_atom_ev is not None
+    ]
+    has_valid_candidate = bool(valid_ranked)
+    for candidate_index, ranked in enumerate(ranked_candidates):
+        outcome = relaxation_outcome(ranked)
+        if ranker.name != "none":
+            energy = (
+                "none"
+                if ranked.energy_per_atom_ev is None
+                else f"{ranked.energy_per_atom_ev:.8f}"
+            )
+            seconds = (
+                "none"
+                if ranked.relaxation_seconds is None
+                else f"{ranked.relaxation_seconds:.1f}"
+            )
+            print(
+                f"Candidate [{material_id} attempt={attempt} "
+                f"{candidate_index + 1}/{len(ranked_candidates)}]: "
+                f"status={outcome} steps={ranked.relaxation_steps} "
+                f"seconds={seconds} energy_per_atom_ev={energy}"
+                + (f" error={ranked.error}" if ranked.error else ""),
+                flush=True,
+            )
+        if not ranked.error and ranked.converged is not False:
+            continue
+        if outcome == "timeout":
+            anomaly_status = "relaxation_timeout"
+        elif outcome == "step_limit":
+            anomaly_status = "relaxation_step_limit"
+        else:
+            anomaly_status = "relaxation_error"
+        anomalies.append(
+            AnomalyResult(
+                parent_id=material_id,
+                source_file=str(path),
+                stage="mlip_relaxation",
+                status=anomaly_status,
+                attempt=attempt,
+                resolved=has_valid_candidate,
+                resolution=(
+                    "Excluded from ranking; a converged candidate was selected"
+                    if has_valid_candidate
+                    else ""
+                ),
+                message=ranked.error or "Relaxation did not converge",
+                candidate_index=candidate_index,
+                num_atoms=len(ranked.structure),
+                converged=ranked.converged,
+                relaxation_steps=ranked.relaxation_steps,
+                relaxation_seconds=ranked.relaxation_seconds,
+                total_energy_ev=ranked.total_energy_ev,
+                energy_per_atom_ev=ranked.energy_per_atom_ev,
+            )
+        )
+    indexed_ranked = sorted(
+        valid_ranked or list(enumerate(ranked_candidates)), key=energy_sort_key
+    )
     if args.keep_top > 0:
         indexed_ranked = indexed_ranked[: args.keep_top]
 
@@ -1789,7 +2115,7 @@ def process_disordered_structure(
         ordered_output_path(args.output_dir, material_id, output_index)
         for output_index in range(len(indexed_ranked))
     ]
-    check_output_collisions(output_paths, args.overwrite)
+    check_output_collisions(output_paths, args.overwrite or args.resume)
     results: list[CandidateResult] = []
     for output_index, (candidate_index, ranked) in enumerate(indexed_ranked):
         energy_rank = output_index + 1
@@ -1823,50 +2149,88 @@ def process_disordered_structure(
             status = "ok"
         else:
             status = "approximation_warning"
-        results.append(
-            CandidateResult(
-                parent_id=material_id,
-                source_file=str(path),
-                status=status,
-                message="; ".join(messages),
-                reference_formula=reference_formula,
-                source_formula=source_formula,
-                cleaned_formula=cleaned.composition.formula,
-                source_num_sites=len(source),
-                dropped_species_count=dropped_count,
-                dropped_occupancy_sum=dropped_sum,
-                grouping_method=grouping_method,
-                candidate_method=candidate_method,
-                split_site_pair_count=len(split_site_pairs),
-                split_site_cluster_count=len(split_site_clusters),
-                split_site_species=",".join(
-                    sorted(
-                        {pair.species for pair in split_site_pairs}
-                        | {cluster.species for cluster in split_site_clusters}
-                    )
-                ),
-                supercell_multiplier=plan.multiplier,
-                supercell_matrix="x".join(str(value) for value in plan.scaling_matrix),
-                occupancy_max_error=plan.max_occupancy_error,
-                occupancy_mean_error=plan.mean_occupancy_error,
-                within_error_tolerance=plan.within_error_tolerance,
-                source_composition_max_error=source_composition_max_error,
-                composition_max_error=plan.composition_max_error,
-                composition_max_drift=plan.composition_max_drift,
-                within_composition_tolerance=plan.within_composition_tolerance,
-                missing_reference_elements=",".join(missing_reference_elements),
-                candidate_index=candidate_index,
-                energy_rank=energy_rank if ranker.name != "none" else None,
-                num_atoms=len(ranked.structure),
-                ordered_formula=ranked.structure.composition.formula,
-                ranker=ranker.name,
-                relaxed=ranked.relaxed,
-                total_energy_ev=ranked.total_energy_ev,
-                energy_per_atom_ev=ranked.energy_per_atom_ev,
-                output_file=str(output_path),
-            )
+        result = CandidateResult(
+            parent_id=material_id,
+            source_file=str(path),
+            status=status,
+            attempt=attempt,
+            message="; ".join(messages),
+            reference_formula=reference_formula,
+            source_formula=source_formula,
+            cleaned_formula=cleaned.composition.formula,
+            source_num_sites=len(source),
+            dropped_species_count=dropped_count,
+            dropped_occupancy_sum=dropped_sum,
+            grouping_method=grouping_method,
+            candidate_method=candidate_method,
+            split_site_pair_count=len(split_site_pairs),
+            split_site_cluster_count=len(split_site_clusters),
+            split_site_species=",".join(
+                sorted(
+                    {pair.species for pair in split_site_pairs}
+                    | {cluster.species for cluster in split_site_clusters}
+                )
+            ),
+            supercell_multiplier=plan.multiplier,
+            supercell_matrix="x".join(str(value) for value in plan.scaling_matrix),
+            occupancy_max_error=plan.max_occupancy_error,
+            occupancy_mean_error=plan.mean_occupancy_error,
+            within_error_tolerance=plan.within_error_tolerance,
+            source_composition_max_error=source_composition_max_error,
+            composition_max_error=plan.composition_max_error,
+            composition_max_drift=plan.composition_max_drift,
+            within_composition_tolerance=plan.within_composition_tolerance,
+            missing_reference_elements=",".join(missing_reference_elements),
+            candidate_index=candidate_index,
+            energy_rank=energy_rank if ranker.name != "none" else None,
+            num_atoms=len(ranked.structure),
+            ordered_formula=ranked.structure.composition.formula,
+            ranker=ranker.name,
+            relaxed=ranked.relaxed,
+            converged=ranked.converged,
+            relaxation_steps=ranked.relaxation_steps,
+            relaxation_seconds=ranked.relaxation_seconds,
+            total_energy_ev=ranked.total_energy_ev,
+            energy_per_atom_ev=ranked.energy_per_atom_ev,
+            output_file=str(output_path),
         )
-    return results
+        results.append(result)
+        if status == "approximation_warning":
+            anomalies.append(
+                AnomalyResult(
+                    parent_id=material_id,
+                    source_file=str(path),
+                    stage="ordering_approximation",
+                    status=status,
+                    attempt=attempt,
+                    message=result.message,
+                    candidate_index=candidate_index,
+                    num_atoms=result.num_atoms,
+                    converged=result.converged,
+                    relaxation_steps=result.relaxation_steps,
+                    relaxation_seconds=result.relaxation_seconds,
+                    total_energy_ev=result.total_energy_ev,
+                    energy_per_atom_ev=result.energy_per_atom_ev,
+                )
+            )
+    converged_count = sum(
+        ranked.converged is True for ranked in ranked_candidates
+    )
+    anomalous_count = sum(
+        ranked.converged is False for ranked in ranked_candidates
+    )
+    unevaluated_count = len(ranked_candidates) - converged_count - anomalous_count
+    selected_indices = ",".join(
+        str(candidate_index) for candidate_index, _ in indexed_ranked
+    )
+    print(
+        f"Material [{material_id} attempt={attempt}] summary: "
+        f"generated={len(ranked_candidates)} converged={converged_count} "
+        f"anomalous={anomalous_count} unevaluated={unevaluated_count} "
+        f"selected_candidate_indices={selected_indices or 'none'}",
+        flush=True,
+    )
+    return results, anomalies
 
 
 def select_input_files(args: argparse.Namespace) -> list[Path]:
@@ -1904,28 +2268,131 @@ def prepare_outputs(args: argparse.Namespace) -> None:
         raise ValueError(f"Refusing unsafe output directory: {resolved_output}")
     if args.output_dir.exists() and not args.output_dir.is_dir():
         raise NotADirectoryError(f"Output directory is not a directory: {args.output_dir}")
-    if args.report_path.exists() and not args.overwrite:
-        raise FileExistsError(
-            f"Report already exists: {args.report_path}. Pass --overwrite to replace it."
-        )
-    if args.report_path.exists():
-        args.report_path.unlink()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.report_path.parent.mkdir(parents=True, exist_ok=True)
+    args.anomaly_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.resume:
+        return
+    for path in (args.report_path, args.anomaly_path):
+        if path.exists() and not args.overwrite:
+            raise FileExistsError(
+                f"Report already exists: {path}. Pass --overwrite to replace it."
+            )
+        if path.exists():
+            path.unlink()
 
 
-def write_report(path: Path, results: Iterable[CandidateResult]) -> None:
-    rows = [asdict(result) for result in results]
-    fieldnames = list(asdict(CandidateResult("", "", "")).keys())
-    with path.open("w", encoding="utf-8", newline="") as stream:
+def load_records(path: Path, record_type: type[Any]) -> list[Any]:
+    if not path.exists():
+        return []
+    field_names = {field.name for field in fields(record_type)}
+    with path.open(encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        return [
+            record_type(
+                **{
+                    name: value
+                    for name, value in row.items()
+                    if name in field_names and value is not None
+                }
+            )
+            for row in reader
+        ]
+
+
+def write_records(path: Path, records: Iterable[Any], record_type: type[Any]) -> None:
+    rows = [asdict(record) for record in records]
+    fieldnames = [field.name for field in fields(record_type)]
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    with temporary_path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+    temporary_path.replace(path)
 
 
-def print_progress(index: int, total: int, start_time: float, path: Path) -> None:
+def write_report(path: Path, results: Iterable[CandidateResult]) -> None:
+    write_records(path, results, CandidateResult)
+
+
+def write_anomaly_report(path: Path, anomalies: Iterable[AnomalyResult]) -> None:
+    write_records(path, anomalies, AnomalyResult)
+
+
+def anomaly_from_existing_result(result: CandidateResult) -> AnomalyResult | None:
+    stage_by_status = {
+        "error": "processing",
+        "ranking_error": "mlip_relaxation",
+        "approximation_warning": "ordering_approximation",
+    }
+    stage = stage_by_status.get(result.status)
+    if stage is None and result.message:
+        stage = "input_validation"
+    if stage is None:
+        return None
+    return AnomalyResult(
+        parent_id=result.parent_id,
+        source_file=result.source_file,
+        stage=stage,
+        status=result.status,
+        attempt=int(result.attempt or 0),
+        message=result.message,
+        candidate_index=result.candidate_index,
+        num_atoms=result.num_atoms,
+        converged=result.converged,
+        relaxation_steps=result.relaxation_steps,
+        relaxation_seconds=result.relaxation_seconds,
+        total_energy_ev=result.total_energy_ev,
+        energy_per_atom_ev=result.energy_per_atom_ev,
+    )
+
+
+RETRYABLE_ANOMALY_STATUSES = {
+    "error",
+    "ranking_error",
+    "relaxation_error",
+    "relaxation_step_limit",
+    "relaxation_timeout",
+}
+
+
+def csv_bool(value: Any) -> bool:
+    return value is True or str(value).strip().lower() == "true"
+
+
+def retryable_parent_ids(anomalies: Iterable[AnomalyResult]) -> set[str]:
+    return {
+        anomaly.parent_id
+        for anomaly in anomalies
+        if anomaly.status in RETRYABLE_ANOMALY_STATUSES
+        and not csv_bool(anomaly.resolved)
+    }
+
+
+def next_attempts(
+    results: Iterable[CandidateResult], parent_ids: Collection[str]
+) -> dict[str, int]:
+    attempts = {parent_id: 1 for parent_id in parent_ids}
+    for result in results:
+        if result.parent_id not in attempts:
+            continue
+        attempts[result.parent_id] = max(
+            attempts[result.parent_id], int(result.attempt or 0) + 1
+        )
+    return attempts
+
+
+def print_progress(
+    index: int,
+    total: int,
+    start_time: float,
+    path: Path,
+    initial_completed: int = 0,
+) -> None:
     elapsed = time.monotonic() - start_time
-    rate = index / elapsed if elapsed > 0 else 0.0
+    completed_this_run = index - initial_completed
+    rate = completed_this_run / elapsed if elapsed > 0 else 0.0
     remaining = (total - index) / rate if rate > 0 else float("inf")
     eta = "unknown" if not math.isfinite(remaining) else f"{remaining / 60:.1f} min"
     print(
@@ -1935,6 +2402,10 @@ def print_progress(index: int, total: int, start_time: float, path: Path) -> Non
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite cannot be used together")
+    if args.report_path.resolve() == args.anomaly_path.resolve():
+        raise ValueError("--report-path and --anomaly-path must be different")
     if not 0 <= args.min_occupancy < 1:
         raise ValueError("--min-occupancy must be in [0, 1)")
     if args.split_site_max_distance <= 0:
@@ -1957,56 +2428,174 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--keep-top cannot be negative")
     if args.progress_every < 1:
         raise ValueError("--progress-every must be positive")
+    if args.relax_steps < 1:
+        raise ValueError("--relax-steps must be positive")
+    if args.relax_timeout < 0:
+        raise ValueError("--relax-timeout cannot be negative")
+    if args.step_progress_every < 1:
+        raise ValueError("--step-progress-every must be positive")
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.retry_anomalies:
+        args.resume = True
+    if args.anomaly_path is None:
+        suffix = args.report_path.suffix or ".csv"
+        args.anomaly_path = args.report_path.with_name(
+            f"{args.report_path.stem}_anomalies{suffix}"
+        )
     validate_args(args)
-    files = select_input_files(args)
-    if not files:
+    selected_files = select_input_files(args)
+    if not selected_files:
         raise FileNotFoundError(f"No CIF files found under {args.input_dir}")
     reference_compositions = load_reference_compositions(args.composition_csv)
     prepare_outputs(args)
 
+    results = (
+        load_records(args.report_path, CandidateResult) if args.resume else []
+    )
+    anomalies = (
+        load_records(args.anomaly_path, AnomalyResult) if args.resume else []
+    )
+    if args.resume and not args.anomaly_path.exists():
+        anomalies = [
+            anomaly
+            for result in results
+            if (anomaly := anomaly_from_existing_result(result)) is not None
+        ]
+    attempt_by_id: dict[str, int] = {}
+    if args.retry_anomalies:
+        retry_ids = retryable_parent_ids(anomalies)
+        if not retry_ids:
+            print(
+                f"Done. No unresolved retryable anomalies in {args.anomaly_path}",
+                flush=True,
+            )
+            return 0
+        selected_ids = {path.stem for path in selected_files}
+        missing_retry_ids = sorted(retry_ids - selected_ids)
+        if missing_retry_ids:
+            raise FileNotFoundError(
+                "Retry inputs are missing: " + ", ".join(missing_retry_ids)
+            )
+        attempt_by_id = next_attempts(results, retry_ids)
+        retry_plan = ", ".join(
+            f"{parent_id}(attempt={attempt_by_id[parent_id]})"
+            for parent_id in sorted(retry_ids)
+        )
+        print(f"Retry plan: {retry_plan}", flush=True)
+        results = [result for result in results if result.parent_id not in retry_ids]
+        anomalies = [
+            anomaly
+            for anomaly in anomalies
+            if anomaly.parent_id not in retry_ids
+        ]
+        selected_files = [
+            path for path in selected_files if path.stem in retry_ids
+        ]
+    completed_ids = {result.parent_id for result in results}
+    pending_files = [
+        path for path in selected_files if path.stem not in completed_ids
+    ]
+    initial_completed = len(selected_files) - len(pending_files)
+
     print(
-        f"Processing {len(files)} CIFs with ranker={args.ranker}. "
+        f"Processing {len(selected_files)} CIFs with ranker={args.ranker}; "
+        f"resumed={initial_completed}, pending={len(pending_files)}. "
+        f"retry_anomalies={args.retry_anomalies}. "
         "MLIP ranking selects low-energy representatives; it does not recover a unique "
         "experimental ordering.",
         flush=True,
     )
+    if not pending_files:
+        print(
+            f"Done. All selected materials are already present in {args.report_path}",
+            flush=True,
+        )
+        return 0
+
     ranker = make_ranker(args)
-    results: list[CandidateResult] = []
     start_time = time.monotonic()
-    for index, path in enumerate(files, start=1):
+    for index, path in enumerate(pending_files, start=initial_completed + 1):
+        attempt = attempt_by_id.get(path.stem, 0)
+        caught_warnings: list[warnings.WarningMessage] = []
         try:
-            results.extend(
-                process_disordered_structure(
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                warnings.simplefilter("always", UserWarning)
+                warnings.simplefilter("ignore", FutureWarning)
+                warnings.simplefilter("ignore", DeprecationWarning)
+                material_results, material_anomalies = process_disordered_structure(
                     path,
                     args,
                     ranker,
                     reference_compositions.get(path.stem),
+                    attempt=attempt,
                 )
-            )
+            results.extend(material_results)
+            anomalies.extend(material_anomalies)
         except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
             results.append(
                 CandidateResult(
                     parent_id=path.stem,
                     source_file=str(path),
                     status="error",
-                    message=f"{type(exc).__name__}: {exc}",
+                    attempt=attempt,
+                    message=message,
                     ranker=ranker.name,
                 )
             )
+            anomalies.append(
+                AnomalyResult(
+                    parent_id=path.stem,
+                    source_file=str(path),
+                    stage="processing",
+                    status="error",
+                    attempt=attempt,
+                    message=message,
+                )
+            )
+        anomalies.extend(
+            AnomalyResult(
+                parent_id=path.stem,
+                source_file=str(path),
+                stage="python_warning",
+                status=warning.category.__name__,
+                attempt=attempt,
+                message=f"{warning.filename}:{warning.lineno}: {warning.message}",
+            )
+            for warning in caught_warnings
+        )
         write_report(args.report_path, results)
-        if index % args.progress_every == 0 or index == len(files):
-            print_progress(index, len(files), start_time, path)
+        write_anomaly_report(args.anomaly_path, anomalies)
+        if (
+            (index - initial_completed) % args.progress_every == 0
+            or index == len(selected_files)
+        ):
+            print_progress(
+                index,
+                len(selected_files),
+                start_time,
+                path,
+                initial_completed=initial_completed,
+            )
 
     ok = sum(result.status in {"ok", "approximation_warning"} for result in results)
-    warnings = sum(result.status == "approximation_warning" for result in results)
+    warning_count = sum(
+        result.status == "approximation_warning" for result in results
+    )
     errors = sum(result.status in {"error", "ranking_error"} for result in results)
+    unresolved_anomalies = retryable_parent_ids(anomalies)
+    resolved_relaxation_anomalies = sum(
+        anomaly.stage == "mlip_relaxation" and csv_bool(anomaly.resolved)
+        for anomaly in anomalies
+    )
     print(
-        f"Done. report={args.report_path} candidates={ok} "
-        f"warnings={warnings} errors={errors}",
+        f"Done. report={args.report_path} anomalies={args.anomaly_path} candidates={ok} "
+        f"warnings={warning_count} errors={errors} "
+        f"resolved_candidate_anomalies={resolved_relaxation_anomalies} "
+        f"unresolved_anomaly_materials={len(unresolved_anomalies)}",
         flush=True,
     )
     return 0 if errors == 0 else 1

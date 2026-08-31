@@ -1,5 +1,6 @@
 import itertools
 import random
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -194,6 +195,165 @@ class OrderingCompositionTest(unittest.TestCase):
 
         self.assertAlmostEqual(max_error, 0.1)
         self.assertAlmostEqual(max_drift, 0.0)
+
+    def test_converged_candidates_sort_before_capped_candidates(self) -> None:
+        source = ordering.parse_structure(DATA_DIR / "cifs" / "duf.cif")
+        capped = ordering.RankedStructure(
+            structure=source,
+            relaxed=True,
+            total_energy_ev=-100.0,
+            energy_per_atom_ev=-10.0,
+            error="Did not converge within 300 steps",
+            converged=False,
+            relaxation_steps=300,
+        )
+        converged = ordering.RankedStructure(
+            structure=source,
+            relaxed=True,
+            total_energy_ev=-1.0,
+            energy_per_atom_ev=-0.1,
+            converged=True,
+            relaxation_steps=25,
+        )
+
+        ranked = sorted(enumerate([capped, converged]), key=ordering.energy_sort_key)
+
+        self.assertEqual(ranked[0][0], 1)
+
+    def test_reports_round_trip_resume_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            report_path = Path(temporary_dir) / "report.csv"
+            anomaly_path = Path(temporary_dir) / "anomalies.csv"
+            result = ordering.CandidateResult(
+                parent_id="sample",
+                source_file="sample.cif",
+                status="ok",
+                converged=True,
+                relaxation_steps=42,
+            )
+            anomaly = ordering.AnomalyResult(
+                parent_id="sample",
+                source_file="sample.cif",
+                stage="mlip_relaxation",
+                status="relaxation_timeout",
+                relaxation_steps=42,
+            )
+
+            ordering.write_report(report_path, [result])
+            ordering.write_anomaly_report(anomaly_path, [anomaly])
+            loaded_results = ordering.load_records(
+                report_path, ordering.CandidateResult
+            )
+            loaded_anomalies = ordering.load_records(
+                anomaly_path, ordering.AnomalyResult
+            )
+
+            self.assertEqual(loaded_results[0].parent_id, "sample")
+            self.assertEqual(loaded_results[0].relaxation_steps, "42")
+            self.assertEqual(loaded_anomalies[0].status, "relaxation_timeout")
+
+    def test_existing_warning_is_backfilled_as_anomaly(self) -> None:
+        result = ordering.CandidateResult(
+            parent_id="sample",
+            source_file="sample.cif",
+            status="approximation_warning",
+            message="Occupancy error exceeds tolerance",
+        )
+
+        anomaly = ordering.anomaly_from_existing_result(result)
+
+        self.assertIsNotNone(anomaly)
+        self.assertEqual(anomaly.stage, "ordering_approximation")
+        self.assertEqual(anomaly.status, "approximation_warning")
+
+    def test_retry_ignores_candidate_failure_resolved_by_other_candidate(self) -> None:
+        resolved = ordering.AnomalyResult(
+            parent_id="resolved",
+            source_file="resolved.cif",
+            stage="mlip_relaxation",
+            status="relaxation_timeout",
+            resolved=True,
+        )
+        unresolved = ordering.AnomalyResult(
+            parent_id="unresolved",
+            source_file="unresolved.cif",
+            stage="mlip_relaxation",
+            status="relaxation_step_limit",
+        )
+
+        retry_ids = ordering.retryable_parent_ids([resolved, unresolved])
+
+        self.assertEqual(retry_ids, {"unresolved"})
+
+    def test_retry_increments_attempt_number(self) -> None:
+        results = [
+            ordering.CandidateResult(
+                parent_id="sample",
+                source_file="sample.cif",
+                status="ranking_error",
+                attempt=2,
+            )
+        ]
+
+        attempts = ordering.next_attempts(results, {"sample"})
+
+        self.assertEqual(attempts["sample"], 3)
+
+    def test_failed_candidate_is_excluded_when_another_converges(self) -> None:
+        class MixedRanker(ordering.Ranker):
+            name = "mattersim"
+
+            def rank(self, structures, label=""):
+                return [
+                    ordering.RankedStructure(
+                        structure=structures[0],
+                        relaxed=True,
+                        total_energy_ev=-1.0,
+                        energy_per_atom_ev=-0.1,
+                        converged=True,
+                        relaxation_steps=20,
+                    ),
+                    ordering.RankedStructure(
+                        structure=structures[1],
+                        relaxed=True,
+                        total_energy_ev=-100.0,
+                        energy_per_atom_ev=-10.0,
+                        error="Did not converge within 300 steps",
+                        converged=False,
+                        relaxation_steps=300,
+                    ),
+                ]
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            output_dir = Path(temporary_dir) / "cifs"
+            output_dir.mkdir()
+            args = ordering.build_parser().parse_args(
+                [
+                    "--output-dir",
+                    str(output_dir),
+                    "--num-candidates",
+                    "2",
+                    "--keep-top",
+                    "1",
+                    "--overwrite",
+                ]
+            )
+            references = ordering.load_reference_compositions(DATA_DIR / "all.csv")
+
+            results, anomalies = ordering.process_disordered_structure(
+                DATA_DIR / "cifs" / "019.cif",
+                args,
+                MixedRanker(),
+                references["019"],
+            )
+
+            self.assertEqual(results[0].candidate_index, 0)
+            self.assertEqual(results[0].status, "ok")
+            self.assertEqual(len(anomalies), 1)
+            self.assertTrue(anomalies[0].resolved)
+            self.assertEqual(
+                anomalies[0].status, "relaxation_step_limit"
+            )
 
     def test_trace_reference_element_survives_ordering(self) -> None:
         references = ordering.load_reference_compositions(DATA_DIR / "all.csv")

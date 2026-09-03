@@ -1,0 +1,8 @@
+- adapter.pretrained_name=mattergen_base
+- data_module=obelix
+- +lightning_module/diffusion_module/model/property_embeddings@adapter.adapter.property_embeddings_adapt.log_ionic_conductivity=log_ionic_conductivity
+- ~trainer.logger
+- data_module.properties=["log_ionic_conductivity"]
+- ~trainer.strategy
+- trainer.accelerator=cpu
+- trainer.max_epochs=1

@@ -1,0 +1,100 @@
+data_module:
+  _target_: mattergen.common.data.datamodule.CrystDataModule
+  _recursive_: true
+  properties:
+  - log_ionic_conductivity
+  transforms:
+  - _target_: mattergen.common.data.transform.symmetrize_lattice
+    _partial_: true
+  - _target_: mattergen.common.data.transform.set_chemical_system_string
+    _partial_: true
+  dataset_transforms:
+  - _target_: mattergen.common.data.dataset_transform.filter_sparse_properties
+    _partial_: true
+  average_density: 0.05771451654022283
+  root_dir: ${oc.env:PROJECT_ROOT}/../datasets/cache/obelix
+  train_dataset:
+    _target_: mattergen.common.data.dataset.CrystalDataset.from_cache_path
+    cache_path: ${data_module.root_dir}/train
+    properties: ${data_module.properties}
+    transforms: ${data_module.transforms}
+    dataset_transforms: ${data_module.dataset_transforms}
+  val_dataset:
+    _target_: mattergen.common.data.dataset.CrystalDataset.from_cache_path
+    cache_path: ${data_module.root_dir}/val
+    properties: ${data_module.properties}
+    transforms: ${data_module.transforms}
+    dataset_transforms: ${data_module.dataset_transforms}
+  num_workers:
+    train: 0
+    val: 0
+    test: 0
+  batch_size:
+    train: ${eval:'(512 // ${trainer.accumulate_grad_batches}) // (${trainer.devices}
+      * ${trainer.num_nodes})'}
+    val: ${eval:'(64 // (${trainer.devices} * ${trainer.num_nodes}))'}
+    test: ${eval:'(64 // (${trainer.devices} * ${trainer.num_nodes}))'}
+  max_epochs: 900
+trainer:
+  _target_: pytorch_lightning.Trainer
+  accelerator: cpu
+  devices: 1
+  num_nodes: 1
+  precision: 32
+  max_epochs: 1
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.5
+  gradient_clip_algorithm: value
+  check_val_every_n_epoch: 5
+  callbacks:
+  - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+    logging_interval: step
+    log_momentum: false
+  - _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    monitor: loss_val
+    mode: min
+    save_top_k: 1
+    save_last: true
+    verbose: false
+    every_n_epochs: 1
+    filename: '{epoch}-{loss_val:.2f}'
+  - _target_: pytorch_lightning.callbacks.TQDMProgressBar
+    refresh_rate: 50
+  - _target_: mattergen.common.data.callback.SetPropertyScalers
+lightning_module:
+  _target_: mattergen.diffusion.lightning_module.DiffusionLightningModule
+  optimizer_partial:
+    lr: 5.0e-06
+    _target_: torch.optim.Adam
+    _partial_: true
+  scheduler_partials:
+  - scheduler:
+      _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+      factor: 0.6
+      patience: 100
+      min_lr: 1.0e-06
+      verbose: true
+      _partial_: true
+    interval: epoch
+    frequency: 1
+    monitor: loss_train
+    strict: true
+adapter:
+  pretrained_name: mattergen_base
+  model_path: null
+  load_epoch: last
+  full_finetuning: true
+  adapter:
+    _target_: mattergen.adapter.GemNetTAdapter
+    property_embeddings_adapt:
+      log_ionic_conductivity:
+        _target_: mattergen.property_embeddings.PropertyEmbedding
+        name: log_ionic_conductivity
+        unconditional_embedding_module:
+          _target_: mattergen.property_embeddings.EmbeddingVector
+          hidden_dim: ${lightning_module.diffusion_module.model.hidden_dim}
+        conditional_embedding_module:
+          _target_: mattergen.diffusion.model_utils.NoiseLevelEncoding
+          d_model: ${lightning_module.diffusion_module.model.hidden_dim}
+        scaler:
+          _target_: mattergen.common.utils.data_utils.StandardScalerTorch
